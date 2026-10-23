@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BPD Watchlist</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 13 L5 8 L8 10 L15 3' fill='none' stroke='%232a78d6' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="menu" class="icon-btn only-mobile" type="button" aria-label="Lists">☰</button>
+    <div class="brand">
+      <svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"><path d="M1 13 L5 8 L8 10 L15 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>BPD Watchlist</span>
+    </div>
+    <input id="search" class="search" type="search" placeholder="Search ticker, name, industry, note…" aria-label="Search">
+    <span class="spacer"></span>
+    <span id="freshness" class="muted small"></span>
+    <button id="reevaluate" class="btn primary" type="button">Re-evaluate</button>
+    <button id="open-import" class="btn" type="button">Import</button>
+    <button id="open-settings" class="icon-btn" type="button" aria-label="Settings" title="Settings">⚙</button>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <div class="layout">
+    <aside id="sidebar" class="sidebar">
+      <nav id="lists" class="lists" aria-label="Watchlists"></nav>
+      <form id="new-list" class="new-list">
+        <input id="new-list-name" placeholder="New list name" aria-label="New list name">
+        <button class="btn small" type="submit">Add</button>
+      </form>
+    </aside>
+
+    <main class="main">
+      <div class="view-head">
+        <div class="title-row">
+          <h1 id="view-title">All names</h1>
+          <span id="view-count" class="muted"></span>
+          <button id="rename-list" class="btn ghost small" type="button" hidden>Rename</button>
+          <button id="delete-list" class="btn ghost small danger" type="button" hidden>Delete list</button>
+        </div>
+        <form id="add-form" class="add-form">
+          <input id="add-input" placeholder="Add tickers: AAPL, MSFT, BRK/B…" aria-label="Add tickers" autocomplete="off" spellcheck="false">
+          <button class="btn" type="submit">Add</button>
+        </form>
+      </div>
+
+      <div class="toolbar">
+        <div class="seg" role="tablist" aria-label="View">
+          <button class="seg-btn" data-view="board" role="tab">Phase board</button>
+          <button class="seg-btn" data-view="table" role="tab">Table</button>
+        </div>
+        <div id="filters" class="filters"></div>
+        <span class="spacer"></span>
+        <button id="export" class="btn ghost small" type="button">Export CSV</button>
+      </div>
+
+      <div id="progress" class="progress" hidden>
+        <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+        <span id="progress-text" class="muted small"></span>
+      </div>
+      <p id="message" class="message" role="status" hidden></p>
+
+      <section id="board" class="board" hidden></section>
+      <section id="table-view" class="card table-card" hidden>
+        <div class="table-wrap">
+          <table id="table"><thead></thead><tbody></tbody></table>
+        </div>
+      </section>
+      <div id="empty" class="empty" hidden></div>
+    </main>
+  </div>
+
+  <aside id="drawer" class="drawer" aria-label="Ticker details" hidden>
+    <div id="drawer-body"></div>
+  </aside>
+  <div id="scrim" class="scrim" hidden></div>
+
+  <dialog id="import-dialog" class="dialog">
+    <form method="dialog" class="dialog-head">
+      <h2>Import watchlist</h2>
+      <button class="icon-btn" value="close" aria-label="Close">✕</button>
+    </form>
+    <div class="dialog-body">
+      <p class="muted">Pick an Excel (.xlsx), CSV or text file. Each sheet can become a list; sheets named after a phase (e.g. “2b AB”, “Minervini 2b+ RS+”) can also set <em>your phase</em> for their names, dated from notes like “20/7 LM: …”.</p>
+      <label class="btn" for="import-file">Choose file…</label>
+      <input id="import-file" type="file" accept=".xlsx,.xlsm,.csv,.txt" hidden>
+      <div id="import-sheets" class="import-sheets"></div>
+    </div>
+    <div class="dialog-foot">
+      <span id="import-summary" class="muted small"></span>
+      <button id="import-commit" class="btn primary" type="button" disabled>Import</button>
+    </div>
+  </dialog>
+
+  <dialog id="settings-dialog" class="dialog wide">
+    <form method="dialog" class="dialog-head">
+      <h2>Settings</h2>
+      <button class="icon-btn" value="close" aria-label="Close">✕</button>
+    </form>
+    <div class="dialog-body">
+      <p class="muted">Thresholds are shared by everyone using this watchlist. After changing them, press <b>Re-evaluate</b>.</p>
+      <div id="threshold-groups" class="threshold-groups"></div>
+    </div>
+    <div class="dialog-foot">
+      <button id="reset-thresholds" class="btn ghost" type="button">Reset to defaults</button>
+      <span class="spacer"></span>
+      <button id="save-thresholds" class="btn primary" type="button">Save</button>
+    </div>
+  </dialog>
+
+  <dialog id="auth-dialog" class="dialog narrow">
+    <form id="auth" class="dialog-body auth">
+      <h2>Team password</h2>
+      <input id="password" type="password" autocomplete="current-password" aria-label="Team password">
+      <p id="auth-error" class="error-text small" hidden></p>
+      <button class="btn primary" type="submit">Unlock</button>
+    </form>
+  </dialog>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

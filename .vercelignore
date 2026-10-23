@@ -1,0 +1,6 @@
+.venv
+tests
+*.xlsx
+*.xlsm
+requirements-dev.txt
+data
