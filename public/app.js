@@ -24,6 +24,7 @@ const state = {
   lists: [],
   tickers: new Map(),
   thresholds: {},
+  thresholdsUpdatedAt: null,
   current: store.get("bpd.current", "all"),
   view: store.get("bpd.view", "board"),
   filter: { verdict: null, changed: false, mismatch: false, doubt: false, search: "" },
@@ -36,6 +37,7 @@ const state = {
 
 let PHASES = [];
 let PHASE_HELP = {};
+let FIELDS = {};  // threshold key -> field from /api/config, plus its group name
 
 // ================================================================ API
 
@@ -54,7 +56,11 @@ async function api(path, options = {}) {
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
     try { detail = (await res.json()).detail || detail; } catch { /* not JSON */ }
-    throw new Error(detail);
+    // Threshold validation (and FastAPI's 422) send a list of problems.
+    const details = Array.isArray(detail) ? detail.map((d) => (typeof d === "string" ? d : d.msg)) : null;
+    const err = new Error(details ? details.join("; ") : detail);
+    err.details = details;
+    throw err;
   }
   return res.json();
 }
@@ -122,6 +128,7 @@ async function loadState() {
   const data = await api("/api/state");
   state.lists = data.lists;
   state.thresholds = data.thresholds || {};
+  state.thresholdsUpdatedAt = data.thresholds_updated_at || null;
   state.tickers = new Map(data.tickers.map((r) => [r.symbol, r]));
   if (state.current !== "all" && !state.lists.some((l) => String(l.id) === String(state.current))) state.current = "all";
   render();
@@ -207,7 +214,9 @@ function renderFreshness() {
   if (!rows.length) { el.textContent = ""; return; }
   const oldest = Math.min(...rows.map((r) => new Date(r.evaluated_at).getTime()));
   const stale = rowsInView().filter(isStale).length;
-  el.innerHTML = `Data ${timeAgo(oldest)}${stale ? ` · <span class="stale">${stale} stale</span>` : ""}`;
+  const old = rowsInView().filter(onOldThresholds).length;
+  el.innerHTML = `Data ${timeAgo(oldest)}${stale ? ` · <span class="stale">${stale} stale</span>` : ""}`
+    + (old ? ` · <button type="button" class="link-btn stale" data-guide="g-settings" title="Evaluated before the thresholds were last changed">${old} on old thresholds</button>` : "");
 }
 
 // ---------------------------------------------------------------- board
@@ -391,6 +400,7 @@ function renderDrawer(r, detail) {
   const ph = s.phase || {};
   const body = $("#drawer-body");
   const l = currentList();
+  const rules = critRules(plainRef);
   const sub = [r.industry, r.tags, s.last_close != null ? `last ${s.last_close} (${s.last_date})` : null].filter(Boolean).map(escapeHtml).join(" · ");
   body.innerHTML = `
     <div class="d-head">
@@ -418,6 +428,7 @@ function renderDrawer(r, detail) {
         </div>` : ""}
         ${ph.doubts?.length ? `<div><b>Unsure - worth a manual look:</b><ul class="notes-list doubts">${ph.doubts.map((d) => `<li>${escapeHtml(d)}</li>`).join("")}</ul></div>` : ""}
         ${ph.flags?.length ? `<div><b>Watch:</b><ul class="notes-list">${ph.flags.map((d) => `<li>${escapeHtml(d)}</li>`).join("")}</ul></div>` : ""}
+        <div><button type="button" class="link-btn small" data-guide="g-phases">How phases are decided</button></div>
         ${r.prev_phase ? `<div class="muted small">Previous evaluation: ${escapeHtml(r.prev_phase)}${r.phase_changed_at ? `, changed ${timeAgo(new Date(r.phase_changed_at).getTime())}` : ""}</div>` : ""}
       </section>
 
@@ -456,9 +467,12 @@ function renderDrawer(r, detail) {
         <h3>BPD setup · ${s.verdict ? `<span class="setup"><span class="dot ${s.verdict}"></span>${VERDICTS[s.verdict]}</span> ${s.score != null ? `· score ${s.score}` : ""}` : "not evaluated"}</h3>
         ${detail?.criteria ? `<ul class="crit-list">${CRITERIA.filter((k) => detail.criteria[k]).map((k) => {
           const c = detail.criteria[k];
+          const rule = rules[k];
           return `<li><span class="st ${c.status}"><i aria-label="${STATUS_TEXT[c.status]}">${ICONS[c.status]}</i></span>
-            <div><div class="crit-name">${escapeHtml(state.config.criteria[k])} · ${escapeHtml(c.value)}</div><div class="crit-detail">${escapeHtml(c.detail)}</div></div></li>`;
-        }).join("")}</ul>` : ""}
+            <div><div class="crit-name">${escapeHtml(state.config.criteria[k])} · ${escapeHtml(c.value)}</div><div class="crit-detail">${escapeHtml(c.detail)}</div>
+            <div class="crit-rule">Pass ${rule.pass} · borderline ${rule.warn}</div></div></li>`;
+        }).join("")}</ul>
+        <button type="button" class="link-btn small" data-guide="g-setup">How the checks work</button>` : ""}
       </section>
 
       <section class="d-section links">
@@ -845,39 +859,331 @@ async function importCommit() {
   }
 }
 
+// ---------------------------------------------------------------- thresholds
+
+function thValue(key) {
+  return state.thresholds[key] ?? FIELDS[key].default;
+}
+function isCustom(key) {
+  return key in state.thresholds && state.thresholds[key] !== FIELDS[key].default;
+}
+// Channel positions and shares of sessions are stored as 0-1 fractions but shown as %.
+function toShown(f, v) {
+  return f.fraction ? +(v * 100).toFixed(6) : v;
+}
+function fromShown(f, v) {
+  return f.fraction ? +(v / 100).toFixed(8) : v;
+}
+function fmtTh(key, v = thValue(key)) {
+  const f = FIELDS[key];
+  const n = toShown(f, v);
+  const s = String(+n.toFixed(2)).replace("-", "−");
+  if (f.unit === "×") return `${s}×`;
+  if (f.unit === "weeks" || f.unit === "sessions") return `${s} ${n === 1 ? f.unit.slice(0, -1) : f.unit}`;
+  return `${s} %`;
+}
+// A live threshold value in the Guide; clicking it opens the editor at that field.
+function thRef(key) {
+  const tip = isCustom(key) ? `Team setting (default ${fmtTh(key, FIELDS[key].default)})` : "Default value";
+  return `<button type="button" class="tv${isCustom(key) ? " custom" : ""}" data-th="${key}" title="${escapeAttr(tip)} - click to change">${escapeHtml(fmtTh(key))}</button>`;
+}
+const plainRef = (key) => escapeHtml(fmtTh(key));
+
+function onOldThresholds(r) {
+  return Boolean(state.thresholdsUpdatedAt && r.evaluated_at && new Date(r.evaluated_at) < new Date(state.thresholdsUpdatedAt));
+}
+
+// Pass / borderline / fail bands of each setup check (mirrors screener/evaluate.py).
+function critRules(ref) {
+  return {
+    base: {
+      measure: "Weeks since the base pivot high",
+      pass: `≥ ${ref("base_pass_weeks")}`, warn: `≥ ${ref("base_warn_weeks")}`,
+      fail: `shorter, or no base (correction deeper than ${ref("base_max_depth_pct")})`,
+    },
+    weekly_bbw: {
+      measure: `Lowest weekly BBW position in its channel during the base (look-back ${ref("weekly_bbw_min_weeks")} to ${ref("weekly_bbw_max_weeks")})`,
+      pass: `≤ ${ref("weekly_bbw_pass")}`, warn: `≤ ${ref("weekly_bbw_warn")}`, fail: "higher",
+    },
+    daily_bbw: {
+      measure: `Share of the last ${ref("daily_bbw_days")} with the daily BBW in the bottom half of its channel`,
+      pass: `≥ ${ref("daily_bbw_pass")}`, warn: `≥ ${ref("daily_bbw_warn")}`, fail: "lower",
+    },
+    rs: {
+      measure: "Best RS of the last 5 sessions vs the RS line's 52-week high",
+      pass: `within ${ref("rs_pass_pct")}`, warn: `within ${ref("rs_warn_pct")}`, fail: "further below",
+    },
+    contraction: {
+      measure: `Average daily range of the last ${ref("contraction_recent_days")} ÷ range of the first third of the base`,
+      pass: `≤ ${ref("contraction_pass")}, or daily BBW now ≤ ${ref("contraction_bbw_now")} of its channel`,
+      warn: `≤ ${ref("contraction_warn")}; also a pass whose latest pullback is the deepest, or a base under 4 weeks`,
+      fail: "higher, or no base",
+    },
+    overhead: {
+      measure: `Share of the volume over the last ${ref("overhead_lookback_days")} that traded above today's close`,
+      pass: `≤ ${ref("overhead_pass_pct")}`, warn: `≤ ${ref("overhead_warn_pct")}`, fail: "more",
+    },
+    eps: {
+      measure: "Latest quarterly EPS vs the same quarter a year earlier",
+      pass: "growth ≥ 0 %, or a turnaround from a loss",
+      warn: `growth ≥ ${ref("eps_warn_growth_pct")}, or EPS > 0 with no year-ago quarter`,
+      fail: "lower growth, or a loss in the latest quarter",
+    },
+  };
+}
+
+// ---------------------------------------------------------------- guide
+
+const GUIDE_SECTIONS = [
+  ["g-start", "Start here"],
+  ["g-settings", "Current thresholds"],
+  ["g-indicators", "Indicators"],
+  ["g-phases", "Phases"],
+  ["g-setup", "BPD setup checks"],
+  ["g-calibration", "Calibration"],
+  ["g-fixed", "Fixed in code"],
+];
+
+function openGuide(section) {
+  renderGuide();
+  const dlg = $("#guide-dialog");
+  if (!dlg.open) dlg.showModal();
+  const target = section && document.getElementById(section);
+  if (target) target.scrollIntoView({ block: "start" });
+  else $("#guide-body").scrollTop = 0;
+}
+
+function renderGuide() {
+  const r = thRef;
+  const custom = Object.keys(FIELDS).filter(isCustom);
+  const old = [...state.tickers.values()].filter(onOldThresholds).length;
+  const rules = critRules(r);
+  const w = state.config.weights;
+  $("#guide-body").innerHTML = `
+    <nav class="guide-toc">${GUIDE_SECTIONS.map(([id, t]) => `<button type="button" class="link-btn" data-guide="${id}">${t}</button>`).join("")}</nav>
+
+    <section id="g-start">
+      <h3>Start here</h3>
+      <p><b>Re-evaluate</b> downloads weekly and daily prices (Yahoo Finance) for every name in the current view and works out
+        two independent things:</p>
+      <ol>
+        <li><b>Phase</b> – where the stock is in its Weinstein cycle (1, 2a, 2b, 3, 4 and the 2a / 2b variants). The phase board is organised by it.</li>
+        <li><b>BPD setup</b> – seven checks on the current base. All pass → <span class="setup"><span class="dot candidate"></span>Candidate</span>,
+          any borderline or missing data → <span class="setup"><span class="dot manual"></span>Check manually</span>,
+          any fail → <span class="setup"><span class="dot reject"></span>Reject</span>.</li>
+      </ol>
+      <p>Both are plain rules with thresholds. Every number shown like ${r("phase_exit_spread_pct")} is the <b>live team setting</b>;
+        click it to change it. Values that differ from the defaults are marked like <span class="tv custom sample">this</span>.</p>
+      <p>The automatic phase is a suggestion. <b>My phase</b> in the ticker drawer records your own call with its date; the
+        <i>Differs from my phase</i> filter shows where the rules and you disagree, and <i>Unsure phase</i> shows calls that sit right on a threshold.</p>
+    </section>
+
+    <section id="g-settings">
+      <h3>Current thresholds</h3>
+      ${custom.length ? `<p>${custom.length} value${custom.length > 1 ? "s differ" : " differs"} from the defaults:</p>
+        <ul>${custom.map((k) => `<li>${escapeHtml(FIELDS[k].group)} › ${escapeHtml(FIELDS[k].label)}: ${r(k)} <span class="muted">(default ${escapeHtml(fmtTh(k, FIELDS[k].default))})</span></li>`).join("")}</ul>`
+        : "<p>All thresholds are at their defaults.</p>"}
+      <p class="muted">${state.thresholdsUpdatedAt ? `Last changed ${new Date(state.thresholdsUpdatedAt).toLocaleString()}.` : "Never changed."}
+        Thresholds are stored in the database and shared by the whole team; they apply from the next evaluation (button or nightly job).</p>
+      ${old ? `<p class="stale">${old} name${old > 1 ? "s were" : " was"} evaluated before the last change. <button type="button" class="btn small" id="guide-reeval">Re-evaluate all</button></p>` : ""}
+      <p><button type="button" class="btn small" data-th="">Edit thresholds</button></p>
+    </section>
+
+    <section id="g-indicators">
+      <h3>Indicators</h3>
+      <dl class="guide-dl">
+        <dt>Weekly bars</dt><dd>Friday closes. During the week the last bar is partial, so a phase can still change by Friday.</dd>
+        <dt>10W / 30W EMA</dt><dd>Exponential moving averages of the weekly close. <b>Spread</b> = 10W ÷ 30W − 1 (−1.5 % means the 10W is 1.5 % below the 30W).
+          <b>Rising / falling</b> = % change over the last ${r("phase_slope_weeks")}.</dd>
+        <dt>RS line</dt><dd>Close ÷ S&amp;P 500 (^GSPC). For phases it is compared with its own ${r("phase_rs_ema_weeks")} EMA
+          (“RS +8 %” = the RS line is 8 % above that EMA). The RS setup check uses the daily RS line vs its 52-week high.</dd>
+        <dt>BB Width (20, 2)</dt><dd>(Upper − lower Bollinger Band) ÷ middle band × 100, as on StockCharts. Low = tight, quiet price action.</dd>
+        <dt>Channel position</dt><dd>Where the BBW sits inside its CHAN(125): the highest and lowest BBW of the previous 125 bars
+          (weeks on the weekly chart, sessions on the daily). 0 % = at the channel low (squeeze), 100 % = at the high, below 0 % = a fresh low.</dd>
+      </dl>
+    </section>
+
+    <section id="g-phases">
+      <h3>Phases</h3>
+      <table class="guide-table"><thead><tr><th>Phase</th><th>Meaning</th></tr></thead><tbody>
+        ${PHASES.map((p) => `<tr><td>${phaseBadge(p)}</td><td>${escapeHtml(PHASE_HELP[p])}</td></tr>`).join("")}
+      </tbody></table>
+
+      <h4>Step 1 – base phase, week by week</h4>
+      <p>A phase depends on what came before it (a sideways range after an uptrend is 3, after a decline it is 1), so the
+        base phase is replayed over the whole weekly history, one week at a time:</p>
+      <table class="guide-table"><thead><tr><th>From</th><th>To</th><th>When</th></tr></thead><tbody>
+        <tr><td>1</td><td>${phaseBadge("2a")}</td><td>10W vs 30W spread above ${r("phase_early_2a_spread_pct")} (negative = the 10W may still be that far below),
+          10W rising ≥ ${r("phase_early_2a_slope_pct")} over the slope window, and the close above the 30W EMA. Catches early 2a before the actual cross.</td></tr>
+        <tr><td>2a</td><td>${phaseBadge("2b")}</td><td>the uptrend has lasted ${r("phase_mature_2a_weeks")} (no phase 3 needed in between)</td></tr>
+        <tr><td>2a / 2b</td><td>${phaseBadge("3")}</td><td>10W ≥ ${r("phase_exit_spread_pct")} below the 30W for ${r("phase_confirm_weeks")} in a row</td></tr>
+        <tr><td>2a</td><td>${phaseBadge("1")}</td><td>the same, but the 2a is younger than ${r("phase_mature_2a_weeks")} – a failed breakout goes back to its base</td></tr>
+        <tr><td>3</td><td>${phaseBadge("2b")}</td><td>10W back ≥ ${r("phase_reentry_margin_pct")} above the 30W and rising</td></tr>
+        <tr><td>3</td><td>${phaseBadge("4")}</td><td>10W below the 30W for ${r("phase_down_weeks")} and a rolling downtrend this week</td></tr>
+        <tr><td>4</td><td>${phaseBadge("1")}</td><td>no rolling downtrend for ${r("phase_four_exit_weeks")} in a row (4 always passes through 1 before 2a)</td></tr>
+        <tr><td>1</td><td>${phaseBadge("4")}</td><td>a rolling downtrend for ${r("phase_down_weeks")} in a row</td></tr>
+      </tbody></table>
+      <p><b>Rolling downtrend</b> = 10W ≥ ${r("phase_reentry_margin_pct")} below the 30W, both EMAs falling and the close below the 30W EMA.
+        The first 30 weeks of history are a warm-up; the replay then starts in 2b (10W above the 30W by the same margin), 4 (rolling downtrend) or 1.</p>
+
+      <h4>Step 2 – splitting phase 2</h4>
+      <table class="guide-table"><thead><tr><th>Phase</th><th>When</th></tr></thead><tbody>
+        <tr><td>${phaseBadge("2b+RS+")}</td><td>base 2b, lowest weekly BBW position of the last ${r("phase_bbw_lookback_weeks")} ≤ ${r("phase_bbw_near_low")},
+          and the RS line ≥ ${r("phase_rs_lead_pct")} above its EMA</td></tr>
+        <tr><td>${phaseBadge("2b+RS-")}</td><td>the same squeeze, RS line less than ${r("phase_rs_lead_pct")} above its EMA</td></tr>
+        <tr><td>${phaseBadge("2b-AB")}</td><td>no 2b+ squeeze, current weekly BBW position ≤ ${r("phase_bbw_half")}</td></tr>
+        <tr><td>${phaseBadge("2b")}</td><td>current weekly BBW position above ${r("phase_bbw_half")}</td></tr>
+        <tr><td>${phaseBadge("2a+")}</td><td>base 2a, RS line above its EMA and that EMA rising over 4 weeks</td></tr>
+        <tr><td>${phaseBadge("2a")}</td><td>base 2a otherwise</td></tr>
+      </tbody></table>
+
+      <h4>Unsure phase and Watch notes</h4>
+      <p><b>Unsure</b> is shown when the call sits right on a line, so a small move would change it: the weekly BBW low within 3 points of the 2b+ line,
+        the weekly BBW within 3 points of the half-channel line, the RS margin within 1.5 points of the RS+ line, or (in phase 2) the 10W within
+        0.5 points of the phase 3 line. <b>Watch</b> notes are early warnings that do not change the phase, e.g. “10W EMA turning down”,
+        “getting loose: weekly volatility expanding without new highs” (weekly BBW above 70 % of its channel and price more than 8 % under its
+        10-week high), “rolling over: could become phase 4”, or 26+ weeks in phase 1 or 3 (a long range where 1 vs 3 is often clear only in hindsight).</p>
+    </section>
+
+    <section id="g-setup">
+      <h3>BPD setup checks</h3>
+      <div class="table-wrap"><table class="guide-table"><thead><tr><th>Check</th><th>Measures</th><th>Pass</th><th>Borderline</th><th>Fail</th></tr></thead><tbody>
+        ${CRITERIA.map((k) => `<tr><td><b>${escapeHtml(state.config.criteria[k])}</b></td><td>${rules[k].measure}</td>
+          <td>${rules[k].pass}</td><td>${rules[k].warn}</td><td>${rules[k].fail}</td></tr>`).join("")}
+      </tbody></table></div>
+      <p><b>Base</b> = the highest high of the longest recent window (up to 2 years) whose correction stays within ${r("base_max_depth_pct")};
+        the last ${r("base_breakout_grace_weeks")} are skipped when looking for that pivot so a fresh breakout keeps its base.
+        Daily BBW gets a ★ when its lowest position in the window is ≤ ${r("daily_bbw_ideal")} (informational only).
+        Contraction counts pullbacks inside the base on weekly swings of at least ${r("pullback_zigzag_pct")} (or 1.5× the stock's median weekly range).
+        ETFs and indexes skip EPS.</p>
+      <p><b>Verdict</b>: any fail → Reject; otherwise any borderline or missing data → Check manually; all pass → Candidate.
+        <b>Score</b> (0–100, for sorting) = weighted average of pass = 1, borderline = ½, fail = 0, with weights
+        ${CRITERIA.map((k) => `${escapeHtml(state.config.criteria[k])} ${w[k]}`).join(", ")}.</p>
+    </section>
+
+    <section id="g-calibration">
+      <h3>Calibration</h3>
+      <p>The phase defaults were fitted to the 113 dated phase calls in the team's WL 2026 sheet (notes like “20/7 LM: …”), each evaluated as of
+        its note date: 61 % exact phase, 73 % the same family (1 / 2a / 2b / 3 / 4); within the 2b group 78 %. The weakest areas are 2a vs 1
+        and early phase 3 calls. Every <b>My phase</b> change is stored with its date and the automatic phase at that moment, so the
+        thresholds can be re-fitted as the set grows.</p>
+    </section>
+
+    <section id="g-fixed">
+      <h3>Fixed in code</h3>
+      <p class="muted">Not adjustable here; change in <code>screener/</code> if needed.</p>
+      <ul>
+        <li>EMA lengths 10 and 30 weeks; Bollinger Bands 20 periods, 2 standard deviations; CHAN(125).</li>
+        <li>RS 52-week high = 252 sessions; the RS check uses the best of the last 5 sessions; 2a+ uses the 4-week slope of the RS EMA.</li>
+        <li>Unsure margins (3 points BBW, 1.5 points RS, 0.5 points 10W/30W) and the 26-week long-range note.</li>
+        <li>Contraction: “deepest latest pullback” downgrade only above 8 %; bases under 4 weeks are too short to measure.</li>
+        <li>EPS: the year-ago quarter must be within 45 days of one year before the latest report.</li>
+      </ul>
+    </section>`;
+  $("#guide-reeval")?.addEventListener("click", () => { $("#guide-dialog").close(); reevaluate([...state.tickers.keys()]); });
+}
+
 // ---------------------------------------------------------------- settings
+
+function openSettings(key) {
+  renderThresholds();
+  const dlg = $("#settings-dialog");
+  if (!dlg.open) dlg.showModal();
+  const input = key && $(`#th-${key}`);
+  if (input) {
+    input.scrollIntoView({ block: "center" });
+    input.focus();
+    input.closest(".th-row").classList.add("flash");
+  }
+}
 
 function renderThresholds() {
   const root = $("#threshold-groups");
   root.innerHTML = "";
+  let section = null;
   for (const group of state.config.thresholds) {
-    const g = document.createElement("div");
-    g.className = "threshold-group";
-    g.innerHTML = `<h3>${escapeHtml(group.group)}</h3>`;
+    if (group.section !== section) {
+      section = group.section;
+      root.insertAdjacentHTML("beforeend", `<h3 class="th-section">${section === "phase" ? "Phase classification" : "BPD setup checks"}</h3>`);
+    }
+    const g = document.createElement("section");
+    g.className = "th-group";
+    g.innerHTML = `<h4>${escapeHtml(group.group)}</h4><p class="muted small">${escapeHtml(group.intro)}</p>`;
     for (const f of group.fields) {
-      const val = state.thresholds[f.key] ?? f.default;
-      const row = document.createElement("label");
-      row.className = "threshold-row";
-      row.innerHTML = `<span>${escapeHtml(f.label)} <span class="muted">(${f.unit})</span></span><input type="number" step="any" data-key="${f.key}" data-default="${f.default}" value="${val}">`;
-      const input = $("input", row);
-      input.classList.toggle("changed", val !== f.default);
-      input.addEventListener("input", () => input.classList.toggle("changed", parseFloat(input.value) !== f.default));
-      g.appendChild(row);
+      g.insertAdjacentHTML("beforeend", `
+        <div class="th-row">
+          <label for="th-${f.key}"><span class="th-label">${escapeHtml(f.label)}</span><span class="th-help">${escapeHtml(f.help)}</span></label>
+          <div class="th-input">
+            <input id="th-${f.key}" type="number" step="${f.integer ? 1 : "any"}" data-key="${f.key}" value="${toShown(f, thValue(f.key))}">
+            <span class="muted small">${escapeHtml(f.unit)}</span>
+          </div>
+          <div class="th-default small">
+            <span class="muted">default ${escapeHtml(fmtTh(f.key, f.default))}</span>
+            <button type="button" class="link-btn" data-reset="${f.key}" hidden>reset</button>
+          </div>
+        </div>`);
     }
     root.appendChild(g);
   }
+  root.querySelectorAll("input").forEach((i) => i.addEventListener("input", () => markThresholds()));
+  root.querySelectorAll("[data-reset]").forEach((b) => b.addEventListener("click", () => {
+    const f = FIELDS[b.dataset.reset];
+    $(`#th-${f.key}`).value = toShown(f, f.default);
+    markThresholds();
+  }));
+  const when = state.thresholdsUpdatedAt;
+  $("#settings-meta").textContent = when ? `Last changed ${new Date(when).toLocaleString()}.` : "";
+  $("#threshold-errors").hidden = true;
+  markThresholds();
 }
 
-async function saveThresholds() {
-  const overrides = {};
+function readThreshold(input) {
+  const v = parseFloat(input.value);
+  return Number.isNaN(v) ? null : fromShown(FIELDS[input.dataset.key], v);
+}
+
+function markThresholds() {
+  let custom = 0, unsaved = 0;
   document.querySelectorAll("#threshold-groups input").forEach((i) => {
-    const v = parseFloat(i.value);
-    if (!Number.isNaN(v) && v !== parseFloat(i.dataset.default)) overrides[i.dataset.key] = v;
+    const key = i.dataset.key;
+    const v = readThreshold(i);
+    const changed = v !== FIELDS[key].default;
+    custom += changed;
+    unsaved += v !== thValue(key);
+    i.closest(".th-row").classList.toggle("changed", changed);
+    $(`[data-reset="${key}"]`).hidden = !changed;
   });
-  const data = await api("/api/settings/thresholds", { method: "PUT", json: overrides });
+  $("#threshold-count").textContent = [custom ? `${custom} differ from default` : "all at defaults", unsaved ? `${unsaved} unsaved` : ""].filter(Boolean).join(" · ");
+}
+
+async function saveThresholds(reevaluateAll = false) {
+  const overrides = {}, errors = [];
+  document.querySelectorAll("#threshold-groups input").forEach((i) => {
+    const f = FIELDS[i.dataset.key];
+    const v = readThreshold(i);
+    if (v === null) errors.push(`${f.group} › ${f.label}: enter a number`);
+    else if (v !== f.default) overrides[f.key] = v;
+  });
+  const showErrors = (list) => {
+    const el = $("#threshold-errors");
+    el.innerHTML = list.map((e) => `<li>${escapeHtml(e)}</li>`).join("");
+    el.hidden = !list.length;
+  };
+  if (errors.length) { showErrors(errors); return; }
+  let data;
+  try {
+    data = await api("/api/settings/thresholds", { method: "PUT", json: overrides });
+  } catch (e) {
+    showErrors(e.details || [e.message]);
+    return;
+  }
   state.thresholds = data.thresholds;
+  state.thresholdsUpdatedAt = data.thresholds_updated_at;
   $("#settings-dialog").close();
-  setMessage("Thresholds saved. Press Re-evaluate to apply them.");
+  if ($("#guide-dialog").open) renderGuide();
+  render();
+  if (reevaluateAll) await reevaluate([...state.tickers.keys()]);
+  else setMessage("Thresholds saved. Re-evaluate to apply them.");
 }
 
 // ---------------------------------------------------------------- CSV
@@ -963,16 +1269,26 @@ async function init() {
   $("#delete-list").addEventListener("click", deleteList);
   $("#export").addEventListener("click", exportCsv);
   $("#scrim").addEventListener("click", closeDrawer);
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.drawer) closeDrawer(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.drawer && !document.querySelector("dialog[open]")) closeDrawer(); });
   $("#menu").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
   $("#open-import").addEventListener("click", () => { state.importSheets = []; $("#import-sheets").innerHTML = ""; importSummary(); $("#import-dialog").showModal(); });
   $("#import-file").addEventListener("change", (e) => { if (e.target.files[0]) importParse(e.target.files[0]); e.target.value = ""; });
   $("#import-commit").addEventListener("click", importCommit);
-  $("#open-settings").addEventListener("click", () => { renderThresholds(); $("#settings-dialog").showModal(); });
+  $("#open-settings").addEventListener("click", () => openSettings());
+  $("#open-guide").addEventListener("click", () => openGuide());
   $("#reset-thresholds").addEventListener("click", () => {
-    document.querySelectorAll("#threshold-groups input").forEach((i) => { i.value = i.dataset.default; i.classList.remove("changed"); });
+    document.querySelectorAll("#threshold-groups input").forEach((i) => { i.value = toShown(FIELDS[i.dataset.key], FIELDS[i.dataset.key].default); });
+    markThresholds();
   });
-  $("#save-thresholds").addEventListener("click", () => saveThresholds().catch((e) => setMessage(e.message, true)));
+  $("#save-thresholds").addEventListener("click", () => saveThresholds());
+  $("#save-reevaluate").addEventListener("click", () => saveThresholds(true));
+  // Live threshold values and "how it works" links can appear anywhere (Guide, drawer, top bar).
+  document.addEventListener("click", (ev) => {
+    const th = ev.target.closest("[data-th]");
+    if (th) { openSettings(th.dataset.th); return; }
+    const guide = ev.target.closest("[data-guide]");
+    if (guide) openGuide(guide.dataset.guide);
+  });
   $("#auth").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     state.password = $("#password").value;
@@ -995,6 +1311,7 @@ async function init() {
   }
   PHASES = state.config.phases.map((p) => p.key);
   PHASE_HELP = Object.fromEntries(state.config.phases.map((p) => [p.key, p.help]));
+  FIELDS = Object.fromEntries(state.config.thresholds.flatMap((g) => g.fields.map((f) => [f.key, { ...f, group: g.group }])));
   if (!state.config.persistent) {
     $("#banner").hidden = false;
     $("#banner").textContent = "Storage on this deployment is temporary - set DATABASE_URL to a Postgres database so the watchlist is kept.";

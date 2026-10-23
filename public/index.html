@@ -19,7 +19,8 @@
     <span id="freshness" class="muted small"></span>
     <button id="reevaluate" class="btn primary" type="button">Re-evaluate</button>
     <button id="open-import" class="btn" type="button">Import</button>
-    <button id="open-settings" class="icon-btn" type="button" aria-label="Settings" title="Settings">⚙</button>
+    <button id="open-guide" class="btn ghost" type="button" title="How phases and setup checks are evaluated">Guide</button>
+    <button id="open-settings" class="icon-btn" type="button" aria-label="Thresholds" title="Thresholds">⚙</button>
   </header>
 
   <div id="banner" class="banner" hidden></div>
@@ -97,18 +98,32 @@
 
   <dialog id="settings-dialog" class="dialog wide">
     <form method="dialog" class="dialog-head">
-      <h2>Settings</h2>
+      <h2>Thresholds</h2>
       <button class="icon-btn" value="close" aria-label="Close">✕</button>
     </form>
     <div class="dialog-body">
-      <p class="muted">Thresholds are shared by everyone using this watchlist. After changing them, press <b>Re-evaluate</b>.</p>
+      <p class="muted">Shared by everyone using this watchlist. New values apply from the next evaluation, so use
+        <b>Save &amp; re-evaluate all</b> to update every name now.
+        <button type="button" class="link-btn" data-guide="g-phases">See the Guide</button> for how each value is used.</p>
+      <p id="settings-meta" class="muted small"></p>
       <div id="threshold-groups" class="threshold-groups"></div>
     </div>
+    <ul id="threshold-errors" class="threshold-errors error-text small" hidden></ul>
     <div class="dialog-foot">
-      <button id="reset-thresholds" class="btn ghost" type="button">Reset to defaults</button>
+      <button id="reset-thresholds" class="btn ghost" type="button">Reset all to defaults</button>
+      <span id="threshold-count" class="muted small"></span>
       <span class="spacer"></span>
-      <button id="save-thresholds" class="btn primary" type="button">Save</button>
+      <button id="save-thresholds" class="btn" type="button">Save</button>
+      <button id="save-reevaluate" class="btn primary" type="button">Save &amp; re-evaluate all</button>
     </div>
+  </dialog>
+
+  <dialog id="guide-dialog" class="dialog wide">
+    <form method="dialog" class="dialog-head">
+      <h2>Guide: how names are evaluated</h2>
+      <button class="icon-btn" value="close" aria-label="Close">✕</button>
+    </form>
+    <div id="guide-body" class="dialog-body guide"></div>
   </dialog>
 
   <dialog id="auth-dialog" class="dialog narrow">

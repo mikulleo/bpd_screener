@@ -114,3 +114,39 @@ def test_thresholds_are_shared_settings():
 def test_static_index_served():
     r = client.get("/")
     assert r.status_code == 200 and "BPD Watchlist" in r.text
+
+
+def test_every_threshold_is_documented_and_reaches_the_phase_rules():
+    from dataclasses import fields as dc_fields
+
+    from screener.config import THRESHOLD_META, validate
+    from screener.phases import PhaseParams
+
+    documented = [k for _, _, _, items in THRESHOLD_META for k, *_ in items]
+    assert sorted(documented) == sorted(f.name for f in dc_fields(Thresholds))
+    assert all(help_ for _, _, _, items in THRESHOLD_META for *_, help_ in items)
+    assert validate(Thresholds()) == []
+    # every tunable phase parameter is driven by a team setting
+    p = Thresholds(phase_slope_weeks=5, phase_four_exit_weeks=4, phase_reentry_margin_pct=0.7).phase_params()
+    assert (p.slope_weeks, p.four_exit_weeks, p.ema_margin_pct) == (5, 4, 0.7)
+    assert {f.name for f in dc_fields(PhaseParams)} == set(vars(p))
+
+
+def test_threshold_validation_rejects_inconsistent_values():
+    r = client.put("/api/settings/thresholds", json={"rs_pass_pct": 12, "weekly_bbw_pass": 1.5, "base_pass_weeks": 9.5})
+    assert r.status_code == 400
+    problems = " | ".join(r.json()["detail"])
+    assert "whole number" in problems and "between 0 and 100" in problems
+    r = client.put("/api/settings/thresholds", json={"rs_pass_pct": 12})
+    assert r.status_code == 400 and "cannot be above" in r.json()["detail"][0]
+
+
+def test_threshold_change_is_timestamped_and_exposed_with_help():
+    client.put("/api/settings/thresholds", json={})
+    client.put("/api/settings/thresholds", json={"phase_rs_lead_pct": 6})
+    state = client.get("/api/state").json()
+    assert state["thresholds"] == {"phase_rs_lead_pct": 6} and state["thresholds_updated_at"]
+    fields = {f["key"]: f for g in client.get("/api/config").json()["thresholds"] for f in g["fields"]}
+    assert fields["phase_bbw_near_low"]["fraction"] and fields["phase_down_weeks"]["integer"]
+    assert fields["phase_rs_lead_pct"]["help"]
+    client.put("/api/settings/thresholds", json={})

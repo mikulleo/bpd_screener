@@ -12,9 +12,17 @@ so you import once, then just press **Re-evaluate** (or let a nightly job do it)
   *my phase* override, list membership, links to StockCharts / TradingView.
 - **Import** the WL xlsx: sheets become lists (name, industry, signal and review columns become
   metadata), and phase-named sheets set *my phase*, dated from notes such as `20/7 LM: …`.
-- **Settings**: thresholds are shared team settings stored in the database.
+- **Guide** (top bar): how phases and the setup checks are evaluated, generated from the *live*
+  thresholds, so it never drifts from what the app actually does. Every number in it is clickable
+  and opens the editor at that value; values that differ from the defaults are highlighted.
+- **Thresholds** (⚙): every rule parameter (phase rules and setup checks) is a shared team setting
+  stored in the database, with an explanation per field, its default, validation (e.g. pass must be
+  stricter than borderline) and *Save & re-evaluate all*. Names evaluated before the last change are
+  flagged as *on old thresholds*.
 
 ## Phases
+
+The tables below show the **defaults**; the in-app Guide shows the values currently in use.
 
 Three lenses (weekly): **10W vs 30W EMA**, **RS** = `ticker:$SPX` vs its 52W EMA, and **BB Width(20,2)**
 position in its **CHAN(125)**. The base phase comes from a weekly state machine, because a phase
@@ -22,12 +30,12 @@ depends on what came before it:
 
 | From | To | When (defaults) |
 |---|---|---|
-| 1 / 4 | **2a** | 10W EMA within 1 % of the 30W (or above), rising ≥ 1 % over 3 wks, price above 30W – catches early 2a before the actual cross |
+| 1 | **2a** | 10W EMA within 1 % of the 30W (or above), rising ≥ 1 % over 3 wks, price above 30W – catches early 2a before the actual cross |
 | 2a | **2b** | uptrend has lasted 8 weeks |
 | 2a / 2b | **3** | 10W EMA ≥ 1.5 % below the 30W for 2 weeks (a failed young 2a goes back to **1**) |
-| 3 | **2b** | 10W back above 30W and rising |
+| 3 | **2b** | 10W back ≥ 0.5 % above 30W and rising |
 | 3 | **4** | 10W below 30W for 8+ weeks and still a rolling downtrend (10W, 30W and price all falling/below) |
-| 4 | **1** | the decline stalls for 3 weeks |
+| 4 | **1** | the decline stalls for 3 weeks (4 always passes through 1 before 2a) |
 | 1 | **4** | the rolling downtrend resumes for 8 weeks in a row |
 
 Phase 2 is then refined:

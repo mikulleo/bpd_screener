@@ -3,6 +3,7 @@
 import hmac
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from pydantic import BaseModel, Field
 
 from . import data as md
 from . import db
-from .config import THRESHOLD_META, Thresholds
-from .evaluate import CRITERIA_LABELS, evaluate_symbol, split_result
+from .config import FRACTION_UNITS, THRESHOLD_META, Thresholds, validate
+from .evaluate import CRITERIA_LABELS, WEIGHTS, evaluate_symbol, split_result
 from .phases import PHASE_HELP, PHASES
 from .tickers import dedupe, normalize, note_date, parse_file
 
@@ -59,10 +60,14 @@ def config():
         "persistent": db.PERSISTENT,
         "max_tickers_per_request": MAX_TICKERS_PER_REQUEST,
         "criteria": CRITERIA_LABELS,
+        "weights": WEIGHTS,
         "phases": [{"key": k, "help": PHASE_HELP[k]} for k in PHASES],
         "thresholds": [
-            {"group": group, "fields": [{"key": k, "label": label, "unit": unit, "default": defaults[k]} for k, label, unit in items]}
-            for group, items in THRESHOLD_META
+            {"section": section, "group": group, "intro": intro, "fields": [
+                {"key": k, "label": label, "unit": unit, "help": help_, "default": defaults[k],
+                 "fraction": unit in FRACTION_UNITS, "integer": isinstance(defaults[k], int)}
+                for k, label, unit, help_ in items]}
+            for section, group, intro, items in THRESHOLD_META
         ],
     }
 
@@ -76,7 +81,12 @@ def auth_check():
 
 @app.get("/api/state", dependencies=auth)
 def state():
-    return {"lists": db.all_lists(), "tickers": db.ticker_rows(), "thresholds": db.get_setting("thresholds", {})}
+    return {
+        "lists": db.all_lists(),
+        "tickers": db.ticker_rows(),
+        "thresholds": db.get_setting("thresholds", {}),
+        "thresholds_updated_at": db.get_setting("thresholds_updated_at"),
+    }
 
 
 @app.get("/api/tickers/{symbol}", dependencies=auth)
@@ -199,9 +209,24 @@ def import_commit(body: ImportBody):
 @app.put("/api/settings/thresholds", dependencies=auth)
 def save_thresholds(overrides: dict):
     defaults = Thresholds().to_dict()
-    clean = {k: v for k, v in overrides.items() if k in defaults and v is not None and v != defaults[k]}
-    db.set_setting("thresholds", clean)
-    return {"thresholds": clean}
+    ints = {f.name for f in fields(Thresholds) if f.type is int}
+    clean, errors = {}, []
+    for k, v in overrides.items():
+        if k not in defaults or v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            errors.append(f"{k}: not a number")
+        elif k in ints and v != int(v):
+            errors.append(f"{k}: must be a whole number")
+        elif v != defaults[k]:
+            clean[k] = int(v) if k in ints else float(v)
+    errors += validate(Thresholds.from_overrides(clean))
+    if errors:
+        raise HTTPException(status_code=400, detail=errors)
+    if clean != db.get_setting("thresholds", {}):
+        db.set_setting("thresholds", clean)
+        db.set_setting("thresholds_updated_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    return {"thresholds": clean, "thresholds_updated_at": db.get_setting("thresholds_updated_at")}
 
 
 @app.get("/api/labels", dependencies=auth)
